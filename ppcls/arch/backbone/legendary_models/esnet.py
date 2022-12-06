@@ -21,6 +21,8 @@ from paddle.nn import Conv2D, BatchNorm, Linear, Dropout
 from paddle.nn import AdaptiveAvgPool2D, MaxPool2D
 from paddle.nn.initializer import KaimingNormal
 from paddle.regularizer import L2Decay
+import paddle.nn.functional as F
+
 
 from ..base.theseus_layer import TheseusLayer
 from ....utils.save_load import load_dygraph_pretrain, load_dygraph_pretrain_from_url
@@ -214,6 +216,376 @@ class ESBlock2(TheseusLayer):
         return x
 
 
+class Identity(nn.Layer):
+    def __init__(self):
+        super(Identity, self).__init__()
+
+    def forward(self, input):
+        return input
+
+
+class Conv2DBN(nn.Layer):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 ks=1,
+                 stride=1,
+                 pad=0,
+                 dilation=1,
+                 groups=1,
+                 bn_weight_init=1,
+                 lr_mult=1.0):
+        super().__init__()
+        conv_weight_attr = paddle.ParamAttr(learning_rate=lr_mult)
+        self.c = nn.Conv2D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=ks,
+            stride=stride,
+            padding=pad,
+            dilation=dilation,
+            groups=groups,
+            weight_attr=conv_weight_attr,
+            bias_attr=False)
+        bn_weight_attr = paddle.ParamAttr(
+            initializer=nn.initializer.Constant(bn_weight_init),
+            learning_rate=lr_mult)
+        bn_bias_attr = paddle.ParamAttr(
+            initializer=nn.initializer.Constant(0), learning_rate=lr_mult)
+        self.bn = nn.BatchNorm2D(
+            out_channels, weight_attr=bn_weight_attr, bias_attr=bn_bias_attr)
+
+    def forward(self, inputs):
+        out = self.c(inputs)
+        out = self.bn(out)
+        return out
+
+
+class ConvBNAct(nn.Layer):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size=1,
+                 stride=1,
+                 padding=0,
+                 groups=1,
+                 norm=nn.BatchNorm2D,
+                 act=None,
+                 bias_attr=False,
+                 lr_mult=1.0,
+                 use_conv=True):
+        super(ConvBNAct, self).__init__()
+        param_attr = paddle.ParamAttr(learning_rate=lr_mult)
+        self.use_conv = use_conv
+        if use_conv:
+            self.conv = nn.Conv2D(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                groups=groups,
+                weight_attr=param_attr,
+                bias_attr=param_attr if bias_attr else False)
+        self.act = act() if act is not None else Identity()
+        self.bn = norm(out_channels, weight_attr=param_attr, bias_attr=param_attr) \
+            if norm is not None else Identity()
+
+    def forward(self, x):
+        if self.use_conv:
+            x = self.conv(x)
+        x = self.bn(x)
+        x = self.act(x)
+        return x
+
+
+class MLP(nn.Layer):
+    def __init__(self,
+                 in_features,
+                 hidden_features=None,
+                 out_features=None,
+                 act_layer=nn.ReLU,
+                 drop=0.,
+                 lr_mult=1.0):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = Conv2DBN(in_features, hidden_features, lr_mult=lr_mult)
+        param_attr = paddle.ParamAttr(learning_rate=lr_mult)
+        self.dwconv = nn.Conv2D(
+            hidden_features,
+            hidden_features,
+            3,
+            1,
+            1,
+            groups=hidden_features,
+            weight_attr=param_attr,
+            bias_attr=param_attr)
+        self.act = act_layer()
+        self.fc2 = Conv2DBN(hidden_features, out_features, lr_mult=lr_mult)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.dwconv(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class InvertedResidual(nn.Layer):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride,
+                 expand_ratio,
+                 activations=None,
+                 lr_mult=1.0):
+        super(InvertedResidual, self).__init__()
+        assert stride in [1, 2], "The stride should be 1 or 2."
+
+        if activations is None:
+            activations = nn.ReLU
+
+        hidden_dim = int(round(in_channels * expand_ratio))
+        self.use_res_connect = stride == 1 and in_channels == out_channels
+
+        layers = []
+        if expand_ratio != 1:
+            layers.append(
+                Conv2DBN(
+                    in_channels, hidden_dim, ks=1, lr_mult=lr_mult))
+            layers.append(activations())
+        layers.extend([
+            Conv2DBN(
+                hidden_dim,
+                hidden_dim,
+                ks=kernel_size,
+                stride=stride,
+                pad=kernel_size // 2,
+                groups=hidden_dim,
+                lr_mult=lr_mult), activations(), Conv2DBN(
+                    hidden_dim, out_channels, ks=1, lr_mult=lr_mult)
+        ])
+        self.conv = nn.Sequential(*layers)
+        self.out_channels = out_channels
+
+    def forward(self, x):
+        if self.use_res_connect:
+            return x + self.conv(x)
+        else:
+            return self.conv(x)
+
+
+class TokenPyramidModule(nn.Layer):
+    def __init__(self,
+                 cfgs,
+                 out_indices,
+                 in_channels=3,
+                 inp_channel=16,
+                 activation=nn.ReLU,
+                 width_mult=1.,
+                 lr_mult=1.):
+        super().__init__()
+        self.out_indices = out_indices
+
+        self.stem = nn.Sequential(
+            Conv2DBN(
+                in_channels, inp_channel, 3, 2, 1, lr_mult=lr_mult),
+            activation())
+
+        self.layers = []
+        for i, (k, t, c, s) in enumerate(cfgs):
+            output_channel = make_divisible(c * width_mult, 8)
+            exp_size = t * inp_channel
+            exp_size = make_divisible(exp_size * width_mult, 8)
+            layer_name = 'layer{}'.format(i + 1)
+            layer = InvertedResidual(
+                inp_channel,
+                output_channel,
+                kernel_size=k,
+                stride=s,
+                expand_ratio=t,
+                activations=activation,
+                lr_mult=lr_mult)
+            self.add_sublayer(layer_name, layer)
+            self.layers.append(layer_name)
+            inp_channel = output_channel
+
+    def forward(self, x):
+        outs = []
+        x = self.stem(x)
+        for i, layer_name in enumerate(self.layers):
+            layer = getattr(self, layer_name)
+            x = layer(x)
+            if i in self.out_indices:
+                outs.append(x)
+        return outs
+
+
+class Attention(nn.Layer):
+    def __init__(self,
+                 dim,
+                 key_dim,
+                 num_heads,
+                 attn_ratio=4,
+                 activation=None,
+                 lr_mult=1.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = key_dim**-0.5
+        self.key_dim = key_dim
+        self.nh_kd = nh_kd = key_dim * num_heads
+        self.d = int(attn_ratio * key_dim)
+        self.dh = int(attn_ratio * key_dim) * num_heads
+        self.attn_ratio = attn_ratio
+
+        self.to_q = Conv2DBN(dim, nh_kd, 1, lr_mult=lr_mult)
+        self.to_k = Conv2DBN(dim, nh_kd, 1, lr_mult=lr_mult)
+        self.to_v = Conv2DBN(dim, self.dh, 1, lr_mult=lr_mult)
+
+        self.proj = nn.Sequential(
+            activation(),
+            Conv2DBN(
+                self.dh, dim, bn_weight_init=0, lr_mult=lr_mult))
+
+    def forward(self, x):
+        x_shape = paddle.shape(x)
+        H, W = x_shape[2], x_shape[3]
+
+        qq = self.to_q(x).reshape(
+            [0, self.num_heads, self.key_dim, -1]).transpose([0, 1, 3, 2])
+        kk = self.to_k(x).reshape([0, self.num_heads, self.key_dim, -1])
+        vv = self.to_v(x).reshape([0, self.num_heads, self.d, -1]).transpose(
+            [0, 1, 3, 2])
+
+        attn = paddle.matmul(qq, kk)
+        attn = F.softmax(attn, axis=-1)
+
+        xx = paddle.matmul(attn, vv)
+
+        xx = xx.transpose([0, 1, 3, 2]).reshape([0, self.dh, H, W])
+        xx = self.proj(xx)
+        return xx
+
+
+class Block(nn.Layer):
+    def __init__(self,
+                 dim,
+                 key_dim,
+                 num_heads,
+                 mlp_ratios=4.,
+                 attn_ratio=2.,
+                 drop=0.,
+                 drop_path=0.,
+                 act_layer=nn.ReLU,
+                 lr_mult=1.0):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.mlp_ratios = mlp_ratios
+
+        # from paddleseg.models.rtformer import ExternalAttention 
+        # self.attn = ExternalAttention(dim, dim, 256, num_heads=8, use_cross_kv=False) 
+        self.attn = Attention(
+           dim,
+           key_dim=key_dim,
+           num_heads=num_heads,
+           attn_ratio=attn_ratio,
+           activation=act_layer,
+           lr_mult=lr_mult)
+
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else Identity()
+        mlp_hidden_dim = int(dim * mlp_ratios)
+        self.mlp = MLP(in_features=dim,
+                       hidden_features=mlp_hidden_dim,
+                       act_layer=act_layer,
+                       drop=drop,
+                       lr_mult=lr_mult)
+
+    def forward(self, x):
+        h = x
+        x = self.attn(x)
+        x = self.drop_path(x)
+        x = h + x
+
+        h = x
+        x = self.mlp(x)
+        x = self.drop_path(x)
+        x = x + h
+        return x
+
+
+class BasicLayer(nn.Layer):
+    def __init__(self,
+                 block_num,
+                 embedding_dim,
+                 key_dim,
+                 num_heads,
+                 mlp_ratios=4.,
+                 attn_ratio=2.,
+                 drop=0.,
+                 attn_drop=0.,
+                 drop_path=0.,
+                 act_layer=None,
+                 lr_mult=1.0):
+        super().__init__()
+        self.block_num = block_num
+
+        self.transformer_blocks = nn.LayerList()
+        for i in range(self.block_num):
+            self.transformer_blocks.append(
+                Block(
+                    embedding_dim,
+                    key_dim=key_dim,
+                    num_heads=num_heads,
+                    mlp_ratios=mlp_ratios,
+                    attn_ratio=attn_ratio,
+                    drop=drop,
+                    drop_path=drop_path[i]
+                    if isinstance(drop_path, list) else drop_path,
+                    act_layer=act_layer,
+                    lr_mult=lr_mult))
+
+    def forward(self, x):
+        # token * N 
+        for i in range(self.block_num):
+            x = self.transformer_blocks[i](x)
+        return x
+
+
+class PyramidPoolAgg(nn.Layer):
+    def __init__(self, stride):
+        super().__init__()
+        self.stride = stride
+        self.tmp = Identity()  # avoid the error of paddle.flops
+
+    def forward(self, inputs):
+        '''
+        # The F.adaptive_avg_pool2d does not support the (H, W) be Tensor,
+        # so exporting the inference model will raise error.
+        _, _, H, W = inputs[-1].shape
+        H = (H - 1) // self.stride + 1
+        W = (W - 1) // self.stride + 1
+        return paddle.concat(
+            [F.adaptive_avg_pool2d(inp, (H, W)) for inp in inputs], axis=1)
+        '''
+        out = []
+        ks = 2**len(inputs)
+        stride = self.stride**len(inputs)
+        for x in inputs:
+            x = F.avg_pool2d(x, int(ks), int(stride))
+            ks /= 2
+            stride /= 2
+            out.append(x)
+        out = paddle.concat(out, axis=1)
+        return out
+
 class ESNet(TheseusLayer):
     def __init__(self,
                  stages_pattern,
@@ -229,7 +601,7 @@ class ESNet(TheseusLayer):
         self.class_expand = class_expand
         stage_repeats = [3, 7, 3]
         stage_out_channels = [
-            -1, 24, make_divisible(116 * scale), make_divisible(232 * scale),
+            -1, 24, make_divisible(116 * scale), make_divisible(232 * scale), # channels: [24,120,232,464] topformer channels [32,64,128,160]
             make_divisible(464 * scale), 1024
         ]
 
@@ -240,8 +612,8 @@ class ESNet(TheseusLayer):
             stride=2)
         self.max_pool = MaxPool2D(kernel_size=3, stride=2, padding=1)
 
-        block_list = []
-        for stage_id, num_repeat in enumerate(stage_repeats):
+        self.block_list = nn.LayerList()
+        for stage_id, num_repeat in enumerate(stage_repeats): # 2, 9, 12
             for i in range(num_repeat):
                 if i == 0:
                     block = ESBlock2(
@@ -251,11 +623,59 @@ class ESNet(TheseusLayer):
                     block = ESBlock1(
                         in_channels=stage_out_channels[stage_id + 2],
                         out_channels=stage_out_channels[stage_id + 2])
-                block_list.append(block)
-        self.blocks = nn.Sequential(*block_list)
+                self.block_list.append(block)
+        # self.blocks = nn.Sequential(*block_list)
+
+        injection_out_channels=[None, 256, 256, 256]
+        encoder_out_indices=[2, 4, 6, 9]
+        trans_out_indices=[1, 2, 3]
+        depths=4
+        key_dim=16
+        num_heads=8
+        attn_ratios=2
+        mlp_ratios=2
+        c2t_stride=2
+        drop_path_rate=0.
+        act_layer=nn.ReLU6
+        injection_type="multi_sum"
+        injection=True
+        lr_mult=0.1
+    #     cfgs = [
+    #     [3, 1, 16, 1],  # 1/2        
+    #     [3, 4, 32, 2],  # 1/4 1      
+    #     [3, 3, 32, 1],  #            
+    #     [5, 3, 64, 2],  # 1/8 3      
+    #     [5, 3, 64, 1],  #            
+    #     [3, 3, 128, 2],  # 1/16 5     
+    #     [3, 3, 128, 1],  #            
+    #     [5, 6, 160, 2],  # 1/32 7     
+    #     [5, 6, 160, 1],  #            
+    #     [3, 6, 160, 1],  #            
+    # ]
+    #     self.feat_channels = [
+    #         c[2] for i, c in enumerate(cfgs) if i in encoder_out_indices
+    #     ]
+        self.embed_dim = 432 # 384<- 432
+
+        self.ppa = PyramidPoolAgg(stride=c2t_stride)
+
+        dpr = [x.item() for x in \
+               paddle.linspace(0, drop_path_rate, depths)]
+        self.trans = BasicLayer(
+            block_num=depths,
+            embedding_dim=self.embed_dim,
+            key_dim=key_dim,
+            num_heads=num_heads,
+            mlp_ratios=mlp_ratios,
+            attn_ratio=attn_ratios,
+            drop=0,
+            attn_drop=0,
+            drop_path=dpr,
+            act_layer=act_layer,
+            lr_mult=lr_mult)
 
         self.conv2 = ConvBNLayer(
-            in_channels=stage_out_channels[-2],
+            in_channels=432,# stage_out_channels[-2],
             out_channels=stage_out_channels[-1],
             kernel_size=1)
 
@@ -279,10 +699,19 @@ class ESNet(TheseusLayer):
             return_stages=return_stages)
 
     def forward(self, x):
+        out_indices=[2, 9, 12]
         x = self.conv1(x)
-        x = self.max_pool(x)
-        x = self.blocks(x)
-        x = self.conv2(x)
+        x = self.max_pool(x) # x4
+        outputs = [x]
+        for i, block in enumerate(self.block_list):
+            x = block(x)
+            if i in out_indices:
+                outputs.append(x)
+        # x = self.blocks(x)   # channels: [24,56,120,232] topformer channels [32,64,128,160] # 直接4倍下采样的，细节信息可能不是很好
+        # 0.5 [512, 24, 56, 56] [512, 56, 28, 28] [512, 120, 14, 14] [512, 232, 7, 7]
+        out = self.ppa(outputs) #1.0: [512, 24, 56, 56];[512, 120, 28, 28][512, 232, 14, 14][512, 464, 7, 7] 
+        out = self.trans(out) # [512, 432, 3, 3]
+        x = self.conv2(out)
         x = self.avg_pool(x)
         x = self.last_conv(x)
         x = self.hardswish(x)
