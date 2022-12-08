@@ -47,8 +47,8 @@ DataLoader:
   Train:
     dataset:
       name: ImageNetDataset
-      image_root: ./dataset/ILSVRC2012/
-      cls_label_path: ./dataset/ILSVRC2012/train_list.txt
+      image_root: ./data/ILSVRC2012/
+      cls_label_path: ./data/ILSVRC2012/train_list.txt
       transform_ops:
         - DecodeImage:
             to_rgb: True
@@ -57,7 +57,6 @@ DataLoader:
             size: 224
         - RandFlipImage:
             flip_code: 1
-        - AutoAugment:
         - NormalizeImage:
             scale: 1.0/255.0
             mean: [0.485, 0.456, 0.406]
@@ -76,8 +75,8 @@ DataLoader:
   Eval:
     dataset: 
       name: ImageNetDataset
-      image_root: ./dataset/ILSVRC2012/
-      cls_label_path: ./dataset/ILSVRC2012/val_list.txt
+      image_root: ./data/ILSVRC2012/
+      cls_label_path: ./data/ILSVRC2012/val_list.txt
       transform_ops:
         - DecodeImage:
             to_rgb: True

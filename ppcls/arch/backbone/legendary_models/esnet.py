@@ -261,44 +261,6 @@ class Conv2DBN(nn.Layer):
         return out
 
 
-class ConvBNAct(nn.Layer):
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size=1,
-                 stride=1,
-                 padding=0,
-                 groups=1,
-                 norm=nn.BatchNorm2D,
-                 act=None,
-                 bias_attr=False,
-                 lr_mult=1.0,
-                 use_conv=True):
-        super(ConvBNAct, self).__init__()
-        param_attr = paddle.ParamAttr(learning_rate=lr_mult)
-        self.use_conv = use_conv
-        if use_conv:
-            self.conv = nn.Conv2D(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                groups=groups,
-                weight_attr=param_attr,
-                bias_attr=param_attr if bias_attr else False)
-        self.act = act() if act is not None else Identity()
-        self.bn = norm(out_channels, weight_attr=param_attr, bias_attr=param_attr) \
-            if norm is not None else Identity()
-
-    def forward(self, x):
-        if self.use_conv:
-            x = self.conv(x)
-        x = self.bn(x)
-        x = self.act(x)
-        return x
-
-
 class MLP(nn.Layer):
     def __init__(self,
                  in_features,
@@ -333,98 +295,6 @@ class MLP(nn.Layer):
         x = self.fc2(x)
         x = self.drop(x)
         return x
-
-
-class InvertedResidual(nn.Layer):
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size,
-                 stride,
-                 expand_ratio,
-                 activations=None,
-                 lr_mult=1.0):
-        super(InvertedResidual, self).__init__()
-        assert stride in [1, 2], "The stride should be 1 or 2."
-
-        if activations is None:
-            activations = nn.ReLU
-
-        hidden_dim = int(round(in_channels * expand_ratio))
-        self.use_res_connect = stride == 1 and in_channels == out_channels
-
-        layers = []
-        if expand_ratio != 1:
-            layers.append(
-                Conv2DBN(
-                    in_channels, hidden_dim, ks=1, lr_mult=lr_mult))
-            layers.append(activations())
-        layers.extend([
-            Conv2DBN(
-                hidden_dim,
-                hidden_dim,
-                ks=kernel_size,
-                stride=stride,
-                pad=kernel_size // 2,
-                groups=hidden_dim,
-                lr_mult=lr_mult), activations(), Conv2DBN(
-                    hidden_dim, out_channels, ks=1, lr_mult=lr_mult)
-        ])
-        self.conv = nn.Sequential(*layers)
-        self.out_channels = out_channels
-
-    def forward(self, x):
-        if self.use_res_connect:
-            return x + self.conv(x)
-        else:
-            return self.conv(x)
-
-
-class TokenPyramidModule(nn.Layer):
-    def __init__(self,
-                 cfgs,
-                 out_indices,
-                 in_channels=3,
-                 inp_channel=16,
-                 activation=nn.ReLU,
-                 width_mult=1.,
-                 lr_mult=1.):
-        super().__init__()
-        self.out_indices = out_indices
-
-        self.stem = nn.Sequential(
-            Conv2DBN(
-                in_channels, inp_channel, 3, 2, 1, lr_mult=lr_mult),
-            activation())
-
-        self.layers = []
-        for i, (k, t, c, s) in enumerate(cfgs):
-            output_channel = make_divisible(c * width_mult, 8)
-            exp_size = t * inp_channel
-            exp_size = make_divisible(exp_size * width_mult, 8)
-            layer_name = 'layer{}'.format(i + 1)
-            layer = InvertedResidual(
-                inp_channel,
-                output_channel,
-                kernel_size=k,
-                stride=s,
-                expand_ratio=t,
-                activations=activation,
-                lr_mult=lr_mult)
-            self.add_sublayer(layer_name, layer)
-            self.layers.append(layer_name)
-            inp_channel = output_channel
-
-    def forward(self, x):
-        outs = []
-        x = self.stem(x)
-        for i, layer_name in enumerate(self.layers):
-            layer = getattr(self, layer_name)
-            x = layer(x)
-            if i in self.out_indices:
-                outs.append(x)
-        return outs
-
 
 class Attention(nn.Layer):
     def __init__(self,
@@ -640,21 +510,7 @@ class ESNet(TheseusLayer):
         injection_type="multi_sum"
         injection=True
         lr_mult=0.1
-    #     cfgs = [
-    #     [3, 1, 16, 1],  # 1/2        
-    #     [3, 4, 32, 2],  # 1/4 1      
-    #     [3, 3, 32, 1],  #            
-    #     [5, 3, 64, 2],  # 1/8 3      
-    #     [5, 3, 64, 1],  #            
-    #     [3, 3, 128, 2],  # 1/16 5     
-    #     [3, 3, 128, 1],  #            
-    #     [5, 6, 160, 2],  # 1/32 7     
-    #     [5, 6, 160, 1],  #            
-    #     [3, 6, 160, 1],  #            
-    # ]
-    #     self.feat_channels = [
-    #         c[2] for i, c in enumerate(cfgs) if i in encoder_out_indices
-    #     ]
+
         self.embed_dim = 432 # 384<- 432
 
         self.ppa = PyramidPoolAgg(stride=c2t_stride)

@@ -21,6 +21,7 @@ import paddle.nn as nn
 from paddle import ParamAttr
 from paddle.nn import AdaptiveAvgPool2D, BatchNorm, Conv2D, Dropout, Linear
 from paddle.regularizer import L2Decay
+import paddle.nn.functional as F
 
 from ..base.theseus_layer import TheseusLayer
 from ....utils.save_load import load_dygraph_pretrain, load_dygraph_pretrain_from_url
@@ -52,7 +53,9 @@ MODEL_STAGES_PATTERN = {
     "MobileNetV3_small":
     ["blocks[0]", "blocks[2]", "blocks[7]", "blocks[10]"],
     "MobileNetV3_large":
-    ["blocks[0]", "blocks[2]", "blocks[5]", "blocks[11]", "blocks[14]"]
+    ["blocks[0]", "blocks[2]", "blocks[5]", "blocks[11]", "blocks[14]"],
+    "MobileNetV3_large_edit":
+    ["blocks[0]", "blocks[2]", "blocks[4]", "blocks[6]", "blocks[9]"]
 }
 
 __all__ = MODEL_URLS.keys()
@@ -70,19 +73,32 @@ NET_CONFIG = {
         # k, exp, c, se, act, s
         [3, 16, 16, False, "relu", 1],
         [3, 64, 24, False, "relu", 2],
-        [3, 72, 24, False, "relu", 1],
+        [3, 72, 24, False, "relu", 1],# 2
         [5, 72, 40, True, "relu", 2],
         [5, 120, 40, True, "relu", 1],
-        [5, 120, 40, True, "relu", 1],
+        [5, 120, 40, True, "relu", 1],# 5
         [3, 240, 80, False, "hardswish", 2],
         [3, 200, 80, False, "hardswish", 1],
         [3, 184, 80, False, "hardswish", 1],
         [3, 184, 80, False, "hardswish", 1],
         [3, 480, 112, True, "hardswish", 1],
-        [3, 672, 112, True, "hardswish", 1],
+        [3, 672, 112, True, "hardswish", 1],# 11
         [5, 672, 160, True, "hardswish", 2],
         [5, 960, 160, True, "hardswish", 1],
+        [5, 960, 160, True, "hardswish", 1],# 14
+    ],
+    "large_edit": [
+        # k, exp, c, se, act, s
+        [3, 16, 16, False, "relu", 1],
+        [3, 64, 32, False, "relu", 2],
+        [3, 72, 32, False, "relu", 1],# 2
+        [5, 72, 64, True, "relu", 2],
+        [5, 128, 64, True, "relu", 1], # 4
+        [3, 384, 128, False, "hardswish", 2],
+        [3, 480, 128, False, "hardswish", 1],# 6
+        [5, 480, 160, True, "hardswish", 2],
         [5, 960, 160, True, "hardswish", 1],
+        [5, 960, 160, True, "hardswish", 1],# 9
     ],
     "small": [
         # k, exp, c, se, act, s
@@ -130,6 +146,248 @@ def _create_act(act):
             "The activation function is not supported: {}".format(act))
 
 
+
+class Identity(nn.Layer):
+    def __init__(self):
+        super(Identity, self).__init__()
+
+    def forward(self, input):
+        return input
+
+
+class Conv2DBN(nn.Layer):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 ks=1,
+                 stride=1,
+                 pad=0,
+                 dilation=1,
+                 groups=1,
+                 bn_weight_init=1,
+                 lr_mult=1.0):
+        super().__init__()
+        conv_weight_attr = paddle.ParamAttr(learning_rate=lr_mult)
+        self.c = nn.Conv2D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=ks,
+            stride=stride,
+            padding=pad,
+            dilation=dilation,
+            groups=groups,
+            weight_attr=conv_weight_attr,
+            bias_attr=False)
+        bn_weight_attr = paddle.ParamAttr(
+            initializer=nn.initializer.Constant(bn_weight_init),
+            learning_rate=lr_mult)
+        bn_bias_attr = paddle.ParamAttr(
+            initializer=nn.initializer.Constant(0), learning_rate=lr_mult)
+        self.bn = nn.BatchNorm2D(
+            out_channels, weight_attr=bn_weight_attr, bias_attr=bn_bias_attr)
+
+    def forward(self, inputs):
+        out = self.c(inputs)
+        out = self.bn(out)
+        return out
+
+
+class MLP(nn.Layer):
+    def __init__(self,
+                 in_features,
+                 hidden_features=None,
+                 out_features=None,
+                 act_layer=nn.ReLU,
+                 drop=0.,
+                 lr_mult=1.0):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = Conv2DBN(in_features, hidden_features, lr_mult=lr_mult)
+        param_attr = paddle.ParamAttr(learning_rate=lr_mult)
+        self.dwconv = nn.Conv2D(
+            hidden_features,
+            hidden_features,
+            3,
+            1,
+            1,
+            groups=hidden_features,
+            weight_attr=param_attr,
+            bias_attr=param_attr)
+        self.act = act_layer()
+        self.fc2 = Conv2DBN(hidden_features, out_features, lr_mult=lr_mult)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.dwconv(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class Attention(nn.Layer):
+    def __init__(self,
+                 dim,
+                 key_dim,
+                 num_heads,
+                 attn_ratio=4,
+                 activation=None,
+                 lr_mult=1.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = key_dim**-0.5
+        self.key_dim = key_dim
+        self.nh_kd = nh_kd = key_dim * num_heads
+        self.d = int(attn_ratio * key_dim)
+        self.dh = int(attn_ratio * key_dim) * num_heads
+        self.attn_ratio = attn_ratio
+
+        self.to_q = Conv2DBN(dim, nh_kd, 1, lr_mult=lr_mult)
+        self.to_k = Conv2DBN(dim, nh_kd, 1, lr_mult=lr_mult)
+        self.to_v = Conv2DBN(dim, self.dh, 1, lr_mult=lr_mult)
+
+        self.proj = nn.Sequential(
+            activation(),
+            Conv2DBN(
+                self.dh, dim, bn_weight_init=0, lr_mult=lr_mult))
+
+    def forward(self, x):
+        x_shape = paddle.shape(x)
+        H, W = x_shape[2], x_shape[3]
+
+        qq = self.to_q(x).reshape(
+            [0, self.num_heads, self.key_dim, -1]).transpose([0, 1, 3, 2])
+        kk = self.to_k(x).reshape([0, self.num_heads, self.key_dim, -1])
+        vv = self.to_v(x).reshape([0, self.num_heads, self.d, -1]).transpose(
+            [0, 1, 3, 2])
+
+        attn = paddle.matmul(qq, kk)
+        attn = F.softmax(attn, axis=-1)
+
+        xx = paddle.matmul(attn, vv)
+
+        xx = xx.transpose([0, 1, 3, 2]).reshape([0, self.dh, H, W])
+        xx = self.proj(xx)
+        return xx
+
+
+class Block(nn.Layer):
+    def __init__(self,
+                 dim,
+                 key_dim,
+                 num_heads,
+                 mlp_ratios=4.,
+                 attn_ratio=2.,
+                 drop=0.,
+                 drop_path=0.,
+                 act_layer=nn.ReLU,
+                 lr_mult=1.0):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.mlp_ratios = mlp_ratios
+
+        # from paddleseg.models.rtformer import ExternalAttention 
+        # self.attn = ExternalAttention(dim, dim, 256, num_heads=8, use_cross_kv=False) 
+        self.attn = Attention(
+           dim,
+           key_dim=key_dim,
+           num_heads=num_heads,
+           attn_ratio=attn_ratio,
+           activation=act_layer,
+           lr_mult=lr_mult)
+
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else Identity()
+        mlp_hidden_dim = int(dim * mlp_ratios)
+        self.mlp = MLP(in_features=dim,
+                       hidden_features=mlp_hidden_dim,
+                       act_layer=act_layer,
+                       drop=drop,
+                       lr_mult=lr_mult)
+
+    def forward(self, x):
+        h = x
+        x = self.attn(x)
+        x = self.drop_path(x)
+        x = h + x
+
+        h = x
+        x = self.mlp(x)
+        x = self.drop_path(x)
+        x = x + h
+        return x
+
+
+class BasicLayer(nn.Layer):
+    def __init__(self,
+                 block_num,
+                 embedding_dim,
+                 key_dim,
+                 num_heads,
+                 mlp_ratios=4.,
+                 attn_ratio=2.,
+                 drop=0.,
+                 attn_drop=0.,
+                 drop_path=0.,
+                 act_layer=None,
+                 lr_mult=1.0):
+        super().__init__()
+        self.block_num = block_num
+
+        self.transformer_blocks = nn.LayerList()
+        for i in range(self.block_num):
+            self.transformer_blocks.append(
+                Block(
+                    embedding_dim,
+                    key_dim=key_dim,
+                    num_heads=num_heads,
+                    mlp_ratios=mlp_ratios,
+                    attn_ratio=attn_ratio,
+                    drop=drop,
+                    drop_path=drop_path[i]
+                    if isinstance(drop_path, list) else drop_path,
+                    act_layer=act_layer,
+                    lr_mult=lr_mult))
+
+    def forward(self, x):
+        # token * N 
+        for i in range(self.block_num):
+            x = self.transformer_blocks[i](x)
+        return x
+
+
+class PyramidPoolAgg(nn.Layer):
+    def __init__(self, stride):
+        super().__init__()
+        self.stride = stride
+        self.tmp = Identity()  # avoid the error of paddle.flops
+
+    def forward(self, inputs):
+        '''
+        # The F.adaptive_avg_pool2d does not support the (H, W) be Tensor,
+        # so exporting the inference model will raise error.
+        _, _, H, W = inputs[-1].shape
+        H = (H - 1) // self.stride + 1
+        W = (W - 1) // self.stride + 1
+        return paddle.concat(
+            [F.adaptive_avg_pool2d(inp, (H, W)) for inp in inputs], axis=1)
+        '''
+        out = []
+        ks = 2**len(inputs)
+        stride = self.stride**len(inputs)
+        for x in inputs:
+            x = F.avg_pool2d(x, int(ks), int(stride))
+            ks /= 2
+            stride /= 2
+            out.append(x)
+        out = paddle.concat(out, axis=1)
+        return out
+
+
 class MobileNetV3(TheseusLayer):
     """
     MobileNetV3
@@ -154,6 +412,7 @@ class MobileNetV3(TheseusLayer):
                  class_squeeze=LAST_SECOND_CONV_LARGE,
                  class_expand=LAST_CONV,
                  dropout_prob=0.2,
+                 out_index=None,
                  return_patterns=None,
                  return_stages=None,
                  **kwargs):
@@ -176,8 +435,9 @@ class MobileNetV3(TheseusLayer):
             if_act=True,
             act="hardswish")
 
-        self.blocks = nn.Sequential(* [
-            ResidualUnit(
+        self.blocks = nn.LayerList()
+        for i, (k, exp, c, se, act, s) in enumerate(self.cfg):
+            self.blocks.append(ResidualUnit(
                 in_c=_make_divisible(self.inplanes * self.scale if i == 0 else
                                      self.cfg[i - 1][2] * self.scale),
                 mid_c=_make_divisible(self.scale * exp),
@@ -185,11 +445,55 @@ class MobileNetV3(TheseusLayer):
                 filter_size=k,
                 stride=s,
                 use_se=se,
-                act=act) for i, (k, exp, c, se, act, s) in enumerate(self.cfg)
-        ])
+                act=act))
+
+        # self.blocks = nn.Sequential(* [
+        #     ResidualUnit(
+        #         in_c=_make_divisible(self.inplanes * self.scale if i == 0 else
+        #                              self.cfg[i - 1][2] * self.scale),
+        #         mid_c=_make_divisible(self.scale * exp),
+        #         out_c=_make_divisible(self.scale * c),
+        #         filter_size=k,
+        #         stride=s,
+        #         use_se=se,
+        #         act=act) for i, (k, exp, c, se, act, s) in enumerate(self.cfg)
+        # ])
+        injection_out_channels=[None, 256, 256, 256]
+        trans_out_indices=[1, 2, 3]
+        depths=4
+        key_dim=16
+        num_heads=8
+        attn_ratios=2
+        mlp_ratios=2
+        c2t_stride=2
+        drop_path_rate=0.
+        act_layer=nn.ReLU6
+        injection_type="multi_sum"
+        injection=True
+        lr_mult=0.1
+        self.out_index = out_index
+
+        self.embed_dim = 336 # 384-> 432  # TODO 384
+
+        self.ppa = PyramidPoolAgg(stride=c2t_stride)
+
+        dpr = [x.item() for x in \
+               paddle.linspace(0, drop_path_rate, depths)]
+        self.trans = BasicLayer(
+            block_num=depths,
+            embedding_dim=self.embed_dim,
+            key_dim=key_dim,
+            num_heads=num_heads,
+            mlp_ratios=mlp_ratios,
+            attn_ratio=attn_ratios,
+            drop=0,
+            attn_drop=0,
+            drop_path=dpr,
+            act_layer=act_layer,
+            lr_mult=lr_mult)
 
         self.last_second_conv = ConvBNLayer(
-            in_c=_make_divisible(self.cfg[-1][2] * self.scale),
+            in_c=_make_divisible(self.embed_dim * self.scale), #_make_divisible(self.cfg[-1][2] * self.scale),
             out_c=_make_divisible(self.scale * self.class_squeeze),
             filter_size=1,
             stride=1,
@@ -224,8 +528,15 @@ class MobileNetV3(TheseusLayer):
 
     def forward(self, x):
         x = self.conv(x)
-        x = self.blocks(x)
-        x = self.last_second_conv(x)
+        outputs = []
+        for i, block in enumerate(self.blocks):
+            x = block(x)
+            if i in self.out_index:
+                outputs.append(x)
+        # x = self.blocks(x)
+        out = self.ppa(outputs) #1.0: [512, 24, 56, 56];[512, 120, 28, 28][512, 232, 14, 14][512, 464, 7, 7] 
+        out = self.trans(out) # [512, 432, 3, 3]
+        x = self.last_second_conv(out)
         x = self.avg_pool(x)
         x = self.last_conv(x)
         x = self.hardswish(x)
@@ -563,9 +874,31 @@ def MobileNetV3_large_x1_0(pretrained=False, use_ssld=False, **kwargs):
         scale=1.0,
         stages_pattern=MODEL_STAGES_PATTERN["MobileNetV3_large"],
         class_squeeze=LAST_SECOND_CONV_LARGE,
+        out_index=[2,5,11,14],
         **kwargs)
     _load_pretrained(pretrained, model, MODEL_URLS["MobileNetV3_large_x1_0"],
                      use_ssld)
+    return model
+
+def MobileNetV3_large_x1_0_edit(pretrained=False, use_ssld=False, **kwargs):
+    """
+    MobileNetV3_large_x1_0
+    Args:
+        pretrained: bool=False or str. If `True` load pretrained parameters, `False` otherwise.
+                    If str, means the path of the pretrained model.
+        use_ssld: bool=False. Whether using distillation pretrained model when pretrained=True.
+    Returns:
+        model: nn.Layer. Specific `MobileNetV3_large_x1_0` model depends on args.
+    """
+    model = MobileNetV3(
+        config=NET_CONFIG["large_edit"],
+        scale=1.0,
+        stages_pattern=MODEL_STAGES_PATTERN["MobileNetV3_large"],
+        class_squeeze=LAST_SECOND_CONV_LARGE,
+        out_index=[2,4,6,9],
+        **kwargs)
+    # _load_pretrained(pretrained, model, MODEL_URLS["MobileNetV3_large_x1_0"],
+    #                  use_ssld)
     return model
 
 
