@@ -446,13 +446,15 @@ class PyramidPoolAgg(nn.Layer):
             [F.adaptive_avg_pool2d(inp, (H, W)) for inp in inputs], axis=1)
         '''
         out = []
-        ks = 2**len(inputs)
-        stride = self.stride**len(inputs)
-        for x in inputs:
+        ks = 2**(len(inputs)-1)
+        stride = self.stride**(len(inputs)-1)
+        for x in inputs[:-1]:
             x = F.avg_pool2d(x, int(ks), int(stride))
             ks /= 2
             stride /= 2
             out.append(x)
+        else:
+            out.append(inputs[-1])
         out = paddle.concat(out, axis=1)
         return out
 
@@ -511,7 +513,7 @@ class ESNet(TheseusLayer):
         injection=True
         lr_mult=0.1
 
-        self.embed_dim = 432 # 384<- 432
+        self.embed_dim = 640 # 384 -> 432
 
         self.ppa = PyramidPoolAgg(stride=c2t_stride)
 
@@ -531,7 +533,7 @@ class ESNet(TheseusLayer):
             lr_mult=lr_mult)
 
         self.conv2 = ConvBNLayer(
-            in_channels=432,# stage_out_channels[-2],
+            in_channels=self.embed_dim,# stage_out_channels[-2],
             out_channels=stage_out_channels[-1],
             kernel_size=1)
 
