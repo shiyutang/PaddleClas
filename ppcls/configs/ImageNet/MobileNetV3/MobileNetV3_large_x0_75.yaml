@@ -16,7 +16,7 @@ Global:
 
 # model architecture
 Arch:
-  name: MobileNetV3_large_x0_75
+  name: MobileNetV3_large_x0_75_edit
   class_num: 1000
  
 # loss function config for traing/eval process
@@ -30,6 +30,20 @@ Loss:
         weight: 1.0
 
 
+# Optimizer:
+#   name: RMSProp
+#   momentum: 0.9
+#   weight_decay: 1e-5
+#   rho: 0.9
+#   epsilon: 0.0316
+#   lr:
+#     name: Step
+#     learning_rate: 0.13
+#     step_size: 2
+#     step_each_epoch: 1
+#     epochs: 600
+#     gamma: 0.973
+#     warmup_epoch: 5
 Optimizer:
   name: Momentum
   momentum: 0.9
@@ -47,8 +61,8 @@ DataLoader:
   Train:
     dataset:
       name: ImageNetDataset
-      image_root: ./dataset/ILSVRC2012/
-      cls_label_path: ./dataset/ILSVRC2012/train_list.txt
+      image_root: ./data/ILSVRC2012/
+      cls_label_path: ./data/ILSVRC2012/train_list.txt
       transform_ops:
         - DecodeImage:
             to_rgb: True
@@ -75,8 +89,8 @@ DataLoader:
   Eval:
     dataset: 
       name: ImageNetDataset
-      image_root: ./dataset/ILSVRC2012/
-      cls_label_path: ./dataset/ILSVRC2012/val_list.txt
+      image_root: ./data/ILSVRC2012/
+      cls_label_path: ./data/ILSVRC2012/val_list.txt
       transform_ops:
         - DecodeImage:
             to_rgb: True

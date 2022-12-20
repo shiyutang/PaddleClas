@@ -15,6 +15,7 @@
 # reference: https://arxiv.org/abs/1905.02244
 
 from __future__ import absolute_import, division, print_function
+import numpy as np
 
 import paddle
 import paddle.nn as nn
@@ -58,7 +59,7 @@ MODEL_STAGES_PATTERN = {
     ["blocks[0]", "blocks[2]", "blocks[4]", "blocks[6]", "blocks[9]"]
 }
 
-__all__ = MODEL_URLS.keys()
+__all__ = list(MODEL_URLS.keys()) + ['MobileNetV3_large_edit']
 
 # "large", "small" is just for MobinetV3_large, MobileNetV3_small respectively.
 # The type of "large" or "small" config is a list. Each element(list) represents a depthwise block, which is composed of k, exp, se, act, s.
@@ -377,13 +378,15 @@ class PyramidPoolAgg(nn.Layer):
             [F.adaptive_avg_pool2d(inp, (H, W)) for inp in inputs], axis=1)
         '''
         out = []
-        ks = 2**len(inputs)
-        stride = self.stride**len(inputs)
-        for x in inputs:
+        ks = 2**(len(inputs)-1)
+        stride = self.stride**(len(inputs)-1)
+        for x in inputs[:-1]:
             x = F.avg_pool2d(x, int(ks), int(stride))
             ks /= 2
             stride /= 2
             out.append(x)
+        else:
+            out.append(inputs[-1])
         out = paddle.concat(out, axis=1)
         return out
 
@@ -415,6 +418,7 @@ class MobileNetV3(TheseusLayer):
                  out_index=None,
                  return_patterns=None,
                  return_stages=None,
+                 enable_repvgg=False,
                  **kwargs):
         super().__init__()
 
@@ -425,15 +429,26 @@ class MobileNetV3(TheseusLayer):
         self.class_expand = class_expand
         self.class_num = class_num
 
-        self.conv = ConvBNLayer(
-            in_c=3,
-            out_c=_make_divisible(self.inplanes * self.scale),
-            filter_size=3,
-            stride=2,
-            padding=1,
-            num_groups=1,
-            if_act=True,
-            act="hardswish")
+        if enable_repvgg:
+            self.conv = ConvBNLayer_repvgg(
+                in_c=3,
+                out_c=_make_divisible(self.inplanes * self.scale),
+                filter_size=3,
+                stride=2,
+                padding=1,
+                num_groups=1,
+                if_act=True,
+                act="hardswish")
+        else:
+            self.conv = ConvBNLayer(
+                in_c=3,
+                out_c=_make_divisible(self.inplanes * self.scale),
+                filter_size=3,
+                stride=2,
+                padding=1,
+                num_groups=1,
+                if_act=True,
+                act="hardswish")
 
         self.blocks = nn.LayerList()
         for i, (k, exp, c, se, act, s) in enumerate(self.cfg):
@@ -445,19 +460,9 @@ class MobileNetV3(TheseusLayer):
                 filter_size=k,
                 stride=s,
                 use_se=se,
-                act=act))
-
-        # self.blocks = nn.Sequential(* [
-        #     ResidualUnit(
-        #         in_c=_make_divisible(self.inplanes * self.scale if i == 0 else
-        #                              self.cfg[i - 1][2] * self.scale),
-        #         mid_c=_make_divisible(self.scale * exp),
-        #         out_c=_make_divisible(self.scale * c),
-        #         filter_size=k,
-        #         stride=s,
-        #         use_se=se,
-        #         act=act) for i, (k, exp, c, se, act, s) in enumerate(self.cfg)
-        # ])
+                act=act,
+                enabel_repvgg=enabel_repvgg))
+                
         injection_out_channels=[None, 256, 256, 256]
         trans_out_indices=[1, 2, 3]
         depths=4
@@ -473,7 +478,9 @@ class MobileNetV3(TheseusLayer):
         lr_mult=0.1
         self.out_index = out_index
 
-        self.embed_dim = 336 # 384-> 432  # TODO 384
+        self.embed_dim = 0
+        for idx in out_index:
+            self.embed_dim += config[idx][2]
 
         self.ppa = PyramidPoolAgg(stride=c2t_stride)
 
@@ -493,7 +500,7 @@ class MobileNetV3(TheseusLayer):
             lr_mult=lr_mult)
 
         self.last_second_conv = ConvBNLayer(
-            in_c=_make_divisible(self.embed_dim * self.scale), #_make_divisible(self.cfg[-1][2] * self.scale),
+            in_c=_make_divisible(self.embed_dim), #_make_divisible(self.cfg[-1][2] * self.scale),
             out_c=_make_divisible(self.scale * self.class_squeeze),
             filter_size=1,
             stride=1,
@@ -559,6 +566,12 @@ class ConvBNLayer(TheseusLayer):
                  if_act=True,
                  act=None):
         super().__init__()
+        self.in_c = in_c
+        self.out_c = out_c
+        self.filter_size = filter_size
+        self.stride = stride
+        self.padding = padding
+        self.num_groups = num_groups
 
         self.conv = Conv2D(
             in_channels=in_c,
@@ -584,6 +597,131 @@ class ConvBNLayer(TheseusLayer):
         return x
 
 
+class ConvBNLayer_repvgg(TheseusLayer):
+    def __init__(self,
+                 in_c,
+                 out_c,
+                 filter_size,
+                 stride,
+                 padding,
+                 num_groups=1,
+                 if_act=True,
+                 act=None,
+                 deploy=False):
+        super().__init__()
+        self.in_c = in_c
+        self.out_c = out_c
+        self.filter_size = filter_size
+        self.stride = stride
+        self.padding = padding
+        self.num_groups = num_groups
+
+        self.bn = BatchNorm(
+            num_channels=out_c,
+            act=None,
+            param_attr=ParamAttr(regularizer=L2Decay(0.0)),
+            bias_attr=ParamAttr(regularizer=L2Decay(0.0)))
+        self.if_act = if_act
+        self.act = _create_act(act)
+       
+        if deploy:
+            self.rbr_reparam = Conv2D(
+            in_channels=in_c,
+            out_channels=out_c,
+            kernel_size=filter_size,
+            stride=stride,
+            padding=padding,
+            groups=num_groups,
+            bias_attr=False)
+        else:
+            padding_11 = padding-filter_size//2 # L47
+            self.rbr_identity = BatchNorm(in_c) if out_c == in_c and stride==1 else None
+            self.rbr_dense = ConvBNLayer(in_c=in_c, out_c=out_c, filter_size=filter_size, 
+                                        stride=stride, padding=padding, num_groups=num_groups, if_act=False)
+            self.rbr_1x1 = ConvBNLayer(in_c=in_c, out_c=out_c, filter_size=1, 
+                                        stride=stride, padding=padding_11, num_groups=num_groups, if_act=False)
+
+
+    def forward(self, x):
+        if hasattr(self, 'rbr_reparam'):
+            x = self.rbr_reparam(x)
+        else:
+            if self.rbr_identity is None:
+                id_out = 0
+            else:
+                id_out = self.rbr_identity(x)
+            
+            x = self.rbr_dense(x) + self.rbr_1x1(x) + id_out
+
+        x = self.bn(x)
+        if self.if_act:
+            x = self.act(x)
+        return x
+    
+    def switch_to_deploy(self):
+        if hasattr(self, 'rbr_reparam'):
+            return
+        try:
+            kernel, bias = self.get_equal_kernel_bias()
+            self.rbr_reparam = Conv2D(in_channels=self.rbr_dense.in_c, out_channels=self.rbr_dense.out_c, kernel_size=self.rbr_dense.filter_size, stride=self.rbr_dense.stride,
+                    padding=self.rbr_dense.padding, groups=self.rbr_dense.num_groups, bias_attr=None) 
+            self.rbr_reparam.weight.set_value(kernel)
+            self.rbr_reparam.bias.set_value(bias)
+        except:
+            import pdb;pdb.set_trace()
+
+        self.__delattr__('rbr_dense')
+        self.__delattr__('rbr_identity')
+        self.__delattr__('rbr_1x1')
+        if hasattr(self, 'id_tensor'):
+            self.__delattr__('id_tensor')
+
+        self.deploy = True
+
+    def get_equal_kernel_bias(self):
+        kernel3x3, bias3x3 = self._fuse_bn_tensor(self.rbr_dense)
+        kernel1x1, bias1x1 = self._fuse_bn_tensor(self.rbr_1x1)
+        kernelid, biasid = self._fuse_bn_tensor(self.rbr_identity)
+
+        return kernel3x3+self._pad_1x1_to_3x3(kernel1x1) + kernelid, bias1x1+bias3x3+biasid
+    
+    def _fuse_bn_tensor(self, branch):
+        if branch is None:
+            return 0, 0
+        if isinstance(branch, BatchNorm):
+            if not hasattr(self, 'id_tensor'):
+                input_dim = self.in_c //self.num_groups
+                kernel_val = np.zeros((self.in_c, input_dim, 3, 3), dtype=np.float32)
+                for i in range(self.in_c):
+                    kernel_val[i, i%input_dim, 1, 1] = 1
+                self.id_tensor = paddle.to_tensor(kernel_val)
+    
+            kernel = self.id_tensor
+            mean = branch._mean
+            var = branch._variance
+            gamma = branch.weight
+            beta = branch.bias
+            eps = branch._epsilon
+        else:
+            kernel = branch.conv.weight
+            mean = branch.bn._mean
+            var = branch.bn._variance
+            gamma = branch.bn.weight
+            beta = branch.bn.bias
+            eps = branch.bn._epsilon
+        
+        std = (var+eps).sqrt()
+        t = (gamma/std).reshape([-1, 1, 1, 1])
+
+        return kernel*t, beta - mean*gamma/std
+    
+    def _pad_1x1_to_3x3(self, kernel1x1):
+        if kernel1x1 is None:
+            return 0
+        else:
+            return F.pad(kernel1x1, [1,1,1,1])
+        
+
 class ResidualUnit(TheseusLayer):
     def __init__(self,
                  in_c,
@@ -592,7 +730,8 @@ class ResidualUnit(TheseusLayer):
                  filter_size,
                  stride,
                  use_se,
-                 act=None):
+                 act=None,
+                 enable_repvgg=False):
         super().__init__()
         self.if_shortcut = stride == 1 and in_c == out_c
         self.if_se = use_se
@@ -605,15 +744,26 @@ class ResidualUnit(TheseusLayer):
             padding=0,
             if_act=True,
             act=act)
-        self.bottleneck_conv = ConvBNLayer(
-            in_c=mid_c,
-            out_c=mid_c,
-            filter_size=filter_size,
-            stride=stride,
-            padding=int((filter_size - 1) // 2),
-            num_groups=mid_c,
-            if_act=True,
-            act=act)
+        if filter_size ==3 and enable_repvgg:
+            self.bottleneck_conv = ConvBNLayer_repvgg(
+                in_c=mid_c,
+                out_c=mid_c,
+                filter_size=filter_size,
+                stride=stride,
+                padding=int((filter_size - 1) // 2),
+                num_groups=mid_c,
+                if_act=True,
+                act=act)
+        else:
+            self.bottleneck_conv = ConvBNLayer(
+                in_c=mid_c,
+                out_c=mid_c,
+                filter_size=filter_size,
+                stride=stride,
+                padding=int((filter_size - 1) // 2),
+                num_groups=mid_c,
+                if_act=True,
+                act=act)
         if self.if_se:
             self.mid_se = SEModule(mid_c)
         self.linear_conv = ConvBNLayer(
@@ -898,7 +1048,29 @@ def MobileNetV3_large_x1_0_edit(pretrained=False, use_ssld=False, **kwargs):
         out_index=[2,4,6,9],
         **kwargs)
     # _load_pretrained(pretrained, model, MODEL_URLS["MobileNetV3_large_x1_0"],
-    #                  use_ssld)
+    #                  use_ssld) # trivial effect when pretrain on ImageNet
+    return model
+
+
+def MobileNetV3_large_x0_75_edit(pretrained=False, use_ssld=False, **kwargs):
+    """
+    MobileNetV3_large_x1_0
+    Args:
+        pretrained: bool=False or str. If `True` load pretrained parameters, `False` otherwise.
+                    If str, means the path of the pretrained model.
+        use_ssld: bool=False. Whether using distillation pretrained model when pretrained=True.
+    Returns:
+        model: nn.Layer. Specific `MobileNetV3_large_x1_0` model depends on args.
+    """
+    model = MobileNetV3(
+        config=NET_CONFIG["large_edit"],
+        scale=0.75,
+        stages_pattern=MODEL_STAGES_PATTERN["MobileNetV3_large"],
+        class_squeeze=LAST_SECOND_CONV_LARGE,
+        out_index=[2,4,6,9],
+        **kwargs)
+    # _load_pretrained(pretrained, model, MODEL_URLS["MobileNetV3_large_x1_0"],
+    #                  use_ssld) # trivial effect when pretrain on ImageNet
     return model
 
 

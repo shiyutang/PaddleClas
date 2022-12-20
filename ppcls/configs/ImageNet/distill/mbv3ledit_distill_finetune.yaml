@@ -1,13 +1,13 @@
 # global configs
 Global:
   checkpoints: null
-  pretrained_model: null
-  output_dir: ./output/
+  pretrained_model: /ssd3/pengjuncai/PaddleSeg/pretrained_model/stdc2net_class_pretrained_cat_pp_distill_resnet50_stdc2net_img500w_gpu8_bs64_ep240_lr0.2
+  output_dir: ./output/mbv3ledit_distill_finetune
   device: gpu
   save_interval: 1
   eval_during_train: True
   eval_interval: 1
-  epochs: 360
+  epochs: 90
   print_batch_step: 10
   use_visualdl: False
   # used for static mode and model export
@@ -16,15 +16,14 @@ Global:
 
 # model architecture
 Arch:
-z  name: MobileNetV3_large_x1_0
+  name: MobileNetV3_large_x0_75_edit
   class_num: 1000
- 
+
 # loss function config for traing/eval process
 Loss:
   Train:
     - CELoss:
         weight: 1.0
-        epsilon: 0.1
   Eval:
     - CELoss:
         weight: 1.0
@@ -35,11 +34,12 @@ Optimizer:
   momentum: 0.9
   lr:
     name: Cosine
-    learning_rate: 0.65
+    learning_rate: 0.04  # base: 0.1 for bs=64*4
     warmup_epoch: 5
+    warmup_start_lr: 0.0002
   regularizer:
     name: 'L2'
-    coeff: 0.00002
+    coeff: 0.0001  # base: 0.0001
 
 
 # data loader for train and eval
@@ -47,8 +47,8 @@ DataLoader:
   Train:
     dataset:
       name: ImageNetDataset
-      image_root: ./data/ILSVRC2012/
-      cls_label_path: ./data/ILSVRC2012/train_list.txt
+      image_root: ./dataset/ILSVRC2012/
+      cls_label_path: ./dataset/ILSVRC2012/train_list.txt
       transform_ops:
         - DecodeImage:
             to_rgb: True
@@ -65,18 +65,18 @@ DataLoader:
 
     sampler:
       name: DistributedBatchSampler
-      batch_size: 256
+      batch_size: 64
       drop_last: False
       shuffle: True
     loader:
-      num_workers: 8
+      num_workers: 5
       use_shared_memory: True
 
   Eval:
     dataset: 
       name: ImageNetDataset
-      image_root: ./data/ILSVRC2012/
-      cls_label_path: ./data/ILSVRC2012/val_list.txt
+      image_root: ./dataset/ILSVRC2012/
+      cls_label_path: ./dataset/ILSVRC2012/val_list.txt
       transform_ops:
         - DecodeImage:
             to_rgb: True
@@ -100,7 +100,7 @@ DataLoader:
       use_shared_memory: True
 
 Infer:
-  infer_imgs: docs/images/inference_deployment/whl_demo.jpg
+  infer_imgs: docs/images/whl/demo.jpg
   batch_size: 10
   transforms:
     - DecodeImage:

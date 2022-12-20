@@ -67,6 +67,10 @@ def classification_eval(engine, epoch_id=0):
                     level=engine.amp_level):
                 out = engine.model(batch[0])
         else:
+            # for name, layer in engine.model.named_sublayers():
+            #     if hasattr(layer, "switch_to_deploy"):
+            #         layer.switch_to_deploy()
+                    # print('Switch {} layer to deploy'.format(name))
             out = engine.model(batch[0])
 
         # just for DistributedBatchSampler issue: repeat sampling

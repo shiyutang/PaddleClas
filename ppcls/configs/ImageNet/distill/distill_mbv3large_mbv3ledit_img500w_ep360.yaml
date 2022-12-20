@@ -2,53 +2,85 @@
 Global:
   checkpoints: null
   pretrained_model: null
-  output_dir: ./output/
+  output_dir: ./output/mbv3large1_distill_mbv3large075edit
   device: gpu
   save_interval: 1
   eval_during_train: True
   eval_interval: 1
-  epochs: 360
+  epochs: 240
   print_batch_step: 10
   use_visualdl: False
   # used for static mode and model export
   image_shape: [3, 224, 224]
   save_inference_dir: ./inference
+  use_dali: false
 
 # model architecture
 Arch:
-z  name: MobileNetV3_large_x1_0
-  class_num: 1000
- 
+  name: "DistillationModel"
+  class_num: &class_num 1000
+  # if not null, its lengths should be same as models
+  pretrained_list:
+  # if not null, its lengths should be same as models
+  freeze_params_list:
+  - True
+  - False
+  models:
+    - Teacher:
+        name: MobileNetV3_large_x1_0
+        class_num: *class_num
+        pretrained: True
+        use_ssld: True
+        dropout_prob: null
+    - Student:
+        name: MobileNetV3_large_x0_75_edit
+        class_num: *class_num
+        pretrained: False
+        dropout_prob: null
+
+
+  infer_model_name: "Student"
+
 # loss function config for traing/eval process
 Loss:
   Train:
-    - CELoss:
+    - DistillationCELoss:
         weight: 1.0
-        epsilon: 0.1
+        model_name_pairs:
+        - ["Student", "Teacher"]
   Eval:
     - CELoss:
         weight: 1.0
 
+Metric:
+    Train:
+    - DistillationTopkAcc:
+        model_key: "Student"
+        topk: [1, 5]
+    Eval:
+    - DistillationTopkAcc:
+        model_key: "Student"
+        topk: [1, 5]
 
 Optimizer:
   name: Momentum
   momentum: 0.9
   lr:
     name: Cosine
-    learning_rate: 0.65
+    learning_rate: 0.65  # base: 0.1 for bs=64*4
     warmup_epoch: 5
+    warmup_start_lr: 0.01
   regularizer:
     name: 'L2'
-    coeff: 0.00002
-
+    coeff: 0.00001     # base: 0.0001
 
 # data loader for train and eval
 DataLoader:
   Train:
     dataset:
       name: ImageNetDataset
-      image_root: ./data/ILSVRC2012/
-      cls_label_path: ./data/ILSVRC2012/train_list.txt
+      image_root: ./datasets/imagenet_500w/
+      cls_label_path: ./datasets/imagenet_500w/train_list_500w.txt
       transform_ops:
         - DecodeImage:
             to_rgb: True
@@ -69,11 +101,11 @@ DataLoader:
       drop_last: False
       shuffle: True
     loader:
-      num_workers: 8
+      num_workers: 4
       use_shared_memory: True
 
   Eval:
-    dataset: 
+    dataset:
       name: ImageNetDataset
       image_root: ./data/ILSVRC2012/
       cls_label_path: ./data/ILSVRC2012/val_list.txt
@@ -92,15 +124,15 @@ DataLoader:
             order: ''
     sampler:
       name: DistributedBatchSampler
-      batch_size: 64
+      batch_size: 128
       drop_last: False
       shuffle: False
     loader:
-      num_workers: 4
+      num_workers: 6
       use_shared_memory: True
 
 Infer:
-  infer_imgs: docs/images/inference_deployment/whl_demo.jpg
+  infer_imgs: docs/images/whl/demo.jpg
   batch_size: 10
   transforms:
     - DecodeImage:
@@ -120,11 +152,3 @@ Infer:
     name: Topk
     topk: 5
     class_id_map_file: ppcls/utils/imagenet1k_label_list.txt
-
-Metric:
-  Train:
-    - TopkAcc:
-        topk: [1, 5]
-  Eval:
-    - TopkAcc:
-        topk: [1, 5]
