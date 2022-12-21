@@ -461,8 +461,8 @@ class MobileNetV3(TheseusLayer):
                 stride=s,
                 use_se=se,
                 act=act,
-                enabel_repvgg=enabel_repvgg))
-                
+                enable_repvgg=enable_repvgg))
+
         injection_out_channels=[None, 256, 256, 256]
         trans_out_indices=[1, 2, 3]
         depths=4
@@ -480,7 +480,7 @@ class MobileNetV3(TheseusLayer):
 
         self.embed_dim = 0
         for idx in out_index:
-            self.embed_dim += config[idx][2]
+            self.embed_dim += _make_divisible(config[idx][2]*self.scale)
 
         self.ppa = PyramidPoolAgg(stride=c2t_stride)
 
