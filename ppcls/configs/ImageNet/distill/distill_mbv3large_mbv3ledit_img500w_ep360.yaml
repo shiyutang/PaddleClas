@@ -67,7 +67,7 @@ Optimizer:
   momentum: 0.9
   lr:
     name: Cosine
-    learning_rate: 0.65  # base: 0.1 for bs=64*4
+    learning_rate: 0.65  # base: 0.1 for bs=64*4 here
     warmup_epoch: 5
     warmup_start_lr: 0.01
   regularizer:

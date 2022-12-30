@@ -14,6 +14,10 @@ Global:
   image_shape: [3, 224, 224]
   save_inference_dir: ./inference
 
+# model ema
+EMA:
+  decay: 0.9999
+
 # model architecture
 Arch:
   name: TopTransformer_Base
@@ -36,12 +40,12 @@ Optimizer:
   momentum: 0.9
   lr:
     name: Cosine
-    learning_rate: 1.3
-    warmup_epoch: 5
+    learning_rate: 0.13
+    warmup_epoch: 3
 
   regularizer:
     name: 'L2'
-    coeff: 0.00002
+    coeff: 0.00001
 
 
 # data loader for train and eval
@@ -49,8 +53,8 @@ DataLoader:
   Train:
     dataset:
       name: ImageNetDataset
-      image_root: ./datasets/ILSVRC2012/
-      cls_label_path: ./datasets/ILSVRC2012/train_list.txt
+      image_root: ./data/ILSVRC2012/
+      cls_label_path: ./data/ILSVRC2012/train_list.txt
       transform_ops:
         - DecodeImage:
             to_rgb: True
@@ -59,15 +63,33 @@ DataLoader:
             size: 224
         - RandFlipImage:
             flip_code: 1
+        - ColorJitter:
+            prob: 0.4
         - NormalizeImage:
             scale: 1.0/255.0
             mean: [0.485, 0.456, 0.406]
             std: [0.229, 0.224, 0.225]
             order: ''
+      batch_transform_ops:
+        - OpSampler:
+            MixupOperator:
+              alpha: 0.2
+              prob: 0.5
+            CutmixOperator:
+              alpha: 1.0
+              prob: 0.5
+        # - OpSampler:
+        #     class_num: 1000
+        #     MixupOperator:
+        #       alpha: 0.2
+        #       prob: 0.5
+        #     CutmixOperator:
+        #       alpha: 1.0
+        #       prob: 0.5
 
     sampler:
       name: DistributedBatchSampler
-      batch_size: 256
+      batch_size: 512
       drop_last: False
       shuffle: True
     loader:
@@ -77,8 +99,8 @@ DataLoader:
   Eval:
     dataset: 
       name: ImageNetDataset
-      image_root: ./datasets/ILSVRC2012/
-      cls_label_path: ./datasets/ILSVRC2012/val_list.txt
+      image_root: ./data/ILSVRC2012/
+      cls_label_path: ./data/ILSVRC2012/val_list.txt
       transform_ops:
         - DecodeImage:
             to_rgb: True

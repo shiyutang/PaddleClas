@@ -5,3 +5,4 @@ from .mobilenet_v3 import MobileNetV3_small_x0_35, MobileNetV3_small_x0_5, Mobil
 from .mobilenet_v2 import TopTransformer_Base
 from .inception_v3 import InceptionV3
 from .vgg import VGG11, VGG13, VGG16, VGG19
+from .mobilenet_v2 import TopTransformer_Base

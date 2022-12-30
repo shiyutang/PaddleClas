@@ -444,6 +444,23 @@ class PyramidPoolAgg(nn.Layer):
         return out
 
 
+class Head(nn.Layer):
+    def __init__(self, embed_dim, class_num):
+        super().__init__()
+        self.bn = nn.BatchNorm2D(embed_dim)
+        self.l = nn.Linear(embed_dim, class_num)
+        self.avg_pool = nn.AdaptiveAvgPool2D(1)
+        self.flatten = nn.Flatten(start_axis=1, stop_axis=-1)
+
+    def forward(self, x):
+        x = self.bn(x)
+        x = self.avg_pool(x)
+        x = self.flatten(x)
+        x = self.l(x)
+
+        return x
+        
+
 class TopTransformer(nn.Layer):
     def __init__(self,
                  cfgs,
@@ -493,17 +510,12 @@ class TopTransformer(nn.Layer):
             num_heads=num_heads,
             mlp_ratios=mlp_ratios,
             attn_ratio=attn_ratios,
-            drop=0,
+            drop=0.2,
             attn_drop=0,
             drop_path=dpr,
             act_layer=act_layer,
             lr_mult=lr_mult)
-        
-        self.avg_pool = nn.AdaptiveAvgPool2D(1)
-
-        self.flatten = nn.Flatten(start_axis=1, stop_axis=-1)
-        self.head_bn = nn.BatchNorm2D(self.embed_dim)
-        self.head_linear = nn.Linear(self.embed_dim, class_num)
+        self.head = Head(self.embed_dim, class_num)
 
     def forward(self, x):
         # [4, 3, 512, 512] [512,3,224,224] channels [32,64,128,160]
@@ -514,11 +526,7 @@ class TopTransformer(nn.Layer):
         out = self.ppa(outputs)
 
         out = self.trans(out)
-
-        out = self.head_bn(out)
-        out = self.avg_pool(out)
-        out = self.flatten(out)
-        out = self.head_linear(out)
+        out = self.head(out)
 
         return out
 
@@ -548,7 +556,7 @@ def TopTransformer_Base(**kwargs):
         attn_ratios=2,
         mlp_ratios=2,
         c2t_stride=2,
-        drop_path_rate=0.,
+        drop_path_rate=0.1,# here
         act_layer=nn.ReLU6,
         injection=True,
         **kwargs)
