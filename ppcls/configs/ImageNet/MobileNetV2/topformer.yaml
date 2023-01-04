@@ -7,12 +7,13 @@ Global:
   save_interval: 1
   eval_during_train: True
   eval_interval: 1
-  epochs: 360
+  epochs: 600
   print_batch_step: 10
   use_visualdl: False
   # used for static mode and model export
   image_shape: [3, 224, 224]
   save_inference_dir: ./inference
+  seed: 42
 
 # model ema
 EMA:
@@ -36,16 +37,20 @@ Loss:
 
 
 Optimizer:
-  name: Momentum
+  name: RMSProp
   momentum: 0.9
+  rho: 0.9
+  epsilon: 0.001
+  weight_decay: 1e-5
   lr:
-    name: Cosine
+    name: Step
     learning_rate: 0.13
+    step_size: 3 # should be 2.4 and there is not lr_noise
+    step_each_epoch: 1
+    epochs: 600
+    gamma: 0.973
     warmup_epoch: 3
-
-  regularizer:
-    name: 'L2'
-    coeff: 0.00001
+    warmup_start_lr: 1e-6
 
 
 # data loader for train and eval
@@ -63,8 +68,10 @@ DataLoader:
             size: 224
         - RandFlipImage:
             flip_code: 1
-        - ColorJitter:
-            prob: 0.4
+        - TimmAutoAugment:
+            config_str: rand-m9-mstd0.5
+            interpolation: random
+            img_size: 224
         - NormalizeImage:
             scale: 1.0/255.0
             mean: [0.485, 0.456, 0.406]
@@ -74,18 +81,10 @@ DataLoader:
         - OpSampler:
             MixupOperator:
               alpha: 0.2
-              prob: 0.5
+              prob: 0.0
             CutmixOperator:
               alpha: 1.0
-              prob: 0.5
-        # - OpSampler:
-        #     class_num: 1000
-        #     MixupOperator:
-        #       alpha: 0.2
-        #       prob: 0.5
-        #     CutmixOperator:
-        #       alpha: 1.0
-        #       prob: 0.5
+              prob: 0.0
 
     sampler:
       name: DistributedBatchSampler
@@ -107,6 +106,7 @@ DataLoader:
             channel_first: False
         - ResizeImage:
             resize_short: 256
+            interpolation: bicubic
         - CropImage:
             size: 224
         - NormalizeImage:
